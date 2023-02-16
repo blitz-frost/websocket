@@ -142,8 +142,8 @@ func (x *Dialer) Dial(url string) (*Conn, error) {
 		wJs:       wasm.BytesWriter{wBytes},
 		closeChan: make(chan struct{}),
 	}
-	o.wBuf = io.NewWriteBuffer(&o.wJs, make([]byte, x.WriteBufferSize))
-	o.rBuf = io.NewReadBuffer(&wasm.BytesReader{}, make([]byte, x.ReadBufferSize))
+	o.wBuf = io.WriteBufferNew(&o.wJs, make([]byte, x.WriteBufferSize))
+	o.rBuf = io.ReadBufferNew(&wasm.BytesReader{}, make([]byte, x.ReadBufferSize))
 
 	// hook close event
 	o.closeFunc = func(c Code) { fmt.Println("websocket closed", c) }

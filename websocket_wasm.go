@@ -135,7 +135,7 @@ func (x *Dialer) Dial(url string) (*Conn, error) {
 	// TODO check if actually connected
 	ws.Set("binaryType", "arraybuffer") // requires ones less async function call to read
 
-	wBytes := wasm.MakeBytes(0, x.WriteBufferSize)
+	wBytes := wasm.BytesMake(0, x.WriteBufferSize)
 
 	o := Conn{
 		V:         ws,

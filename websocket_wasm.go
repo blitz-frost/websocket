@@ -65,6 +65,8 @@ type Conn struct {
 	closeFunc    func(Code)
 	closeChan    chan struct{}
 
+	errorHandler js.Func
+
 	msgHandler js.Func
 	dstBinary  msg.ReaderTaker
 	dstText    msg.ReaderTaker
@@ -124,6 +126,12 @@ func (x *Conn) Writer(ch byte) (msg.Writer, error) {
 	}, nil
 }
 
+func (x *Conn) cleanup() {
+	x.msgHandler.Release()
+	x.closeHandler.Release()
+	x.errorHandler.Release()
+}
+
 type Dialer struct {
 	ReadBufferSize  int // controls minimum read size from JS to Go
 	WriteBufferSize int // controls minimum write size from Go to JS
@@ -132,7 +140,7 @@ type Dialer struct {
 // Dial opens a new websocket connection.
 func (x *Dialer) Dial(url string) (*Conn, error) {
 	ws := global.Get("WebSocket").New(url)
-	// TODO check if actually connected
+
 	ws.Set("binaryType", "arraybuffer") // requires ones less async function call to read
 
 	wBytes := wasm.BytesMake(0, x.WriteBufferSize)
@@ -152,9 +160,7 @@ func (x *Dialer) Dial(url string) (*Conn, error) {
 		o.closeFunc(code)
 		close(o.closeChan)
 
-		// cleanup
-		o.msgHandler.Release()
-		o.closeHandler.Release()
+		o.cleanup()
 
 		return nil
 	})
@@ -185,6 +191,15 @@ func (x *Dialer) Dial(url string) (*Conn, error) {
 	})
 	ws.Set("onmessage", o.msgHandler)
 
+	// failing to connect will issue an error event
+	// the close handler will also be called afterwards
+	errorChan := make(chan struct{})
+	o.errorHandler = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		close(errorChan)
+		return nil
+	})
+	ws.Set("onerror", o.errorHandler)
+
 	// wait for connection
 	ch := make(chan struct{})
 	fn := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
@@ -192,9 +207,14 @@ func (x *Dialer) Dial(url string) (*Conn, error) {
 		return nil
 	})
 	ws.Set("onopen", fn)
+	defer fn.Release()
 
-	<-ch
-	fn.Release()
+	select {
+	case <-ch:
+	case <-errorChan:
+		return nil, errors.New("connection failed")
+	}
+
 	return &o, nil
 }
 

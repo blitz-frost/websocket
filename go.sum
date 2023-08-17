@@ -4,5 +4,7 @@ github.com/blitz-frost/msg v0.1.1 h1:C9fGUhBeW7BcJMBhMirWNom09QX6cwpEf0LIW7/vibI
 github.com/blitz-frost/msg v0.1.1/go.mod h1:uQy8Tigo19XA/i/GeXC3+NtTFUzD08mdagIezoN44ec=
 github.com/blitz-frost/wasm v0.2.9 h1:KdOVBKD7O8KDy19Ykz8M+JL9fr1SEKgWppcrTRSo1lE=
 github.com/blitz-frost/wasm v0.2.9/go.mod h1:EhJH7ZKLoWr+Vwc4XwHN89UECcgOXNO0dcMn3LgC6x0=
+github.com/blitz-frost/wasm v0.2.12 h1:Ea10a7ZxU3NOVSjzt25Qs9+sQIHyzFxRLXM3dhm5RbA=
+github.com/blitz-frost/wasm v0.2.12/go.mod h1:EhJH7ZKLoWr+Vwc4XwHN89UECcgOXNO0dcMn3LgC6x0=
 github.com/gorilla/websocket v1.5.0 h1:PPwGk2jz7EePpoHN/+ClbZu8SPxiqlu12wZP/3sWmnc=
 github.com/gorilla/websocket v1.5.0/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=

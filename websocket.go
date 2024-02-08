@@ -4,6 +4,7 @@ package websocket
 
 import (
 	"errors"
+	stdio "io"
 	"net/http"
 
 	"github.com/blitz-frost/io"
@@ -29,16 +30,21 @@ type Conn struct {
 
 	dstBinary msg.ReaderTaker
 	dstText   msg.ReaderTaker
+
+	closed bool // Close method call; shouldn't need to be atomic
 }
 
 func (x *Conn) Close() error {
+	x.closed = true
 	return x.V.Close()
 }
 
 // Listen routes incoming messages according to their type.
 // If no target has been specified for a channel, the messages from that channel will be discarded.
-// Returns on error. In particular, a chained ReaderTaker should not return an error when the connection should be kept alive.
-func (x *Conn) Listen() error {
+// Returns on error, or when closed. In either case, the websocket is no longer usable. In particular, a chained ReaderTaker should not return an error when the connection should be kept alive.
+//
+// An active Listen loop is necessary in order to drain incoming messages.
+func (x *Conn) Listen() (err error) {
 	if x.dstBinary == nil {
 		x.dstBinary = msg.Void{}
 	}
@@ -46,21 +52,36 @@ func (x *Conn) Listen() error {
 		x.dstText = msg.Void{}
 	}
 
+	defer func() {
+		if x.closed {
+			// termination due to explicit Close call is not considered an error
+			err = nil
+		} else {
+			// a ReaderTake error might leave the connection open
+			// automatically close it
+			x.V.Close()
+		}
+	}()
+
+	var (
+		ch int
+		r  stdio.Reader
+	)
 	for {
-		ch, r, err := x.V.NextReader()
+		ch, r, err = x.V.NextReader()
 		if err != nil {
-			return err
+			return
 		}
 		rc := io.ReaderOf(r)
 
 		switch byte(ch) {
 		case ChannelBinary:
-			if err := x.dstBinary.ReaderTake(rc); err != nil {
-				return err
+			if err = x.dstBinary.ReaderTake(rc); err != nil {
+				return
 			}
 		case ChannelText:
-			if err := x.dstText.ReaderTake(rc); err != nil {
-				return err
+			if err = x.dstText.ReaderTake(rc); err != nil {
+				return
 			}
 		}
 	}

@@ -21,21 +21,21 @@ const (
 
 const (
 	CodeNormal          Code = 1000
-	CodeGoingAway            = 1001
-	CodeProtocolError        = 1002
-	CodeUnsupported          = 1003
-	CodeReserved             = 1004
-	CodeNoStatus             = 1005
-	CodeAbnormal             = 1006
-	CodeInvalidFrame         = 1007
-	CodePolicyViolation      = 1008
-	CodeTooBig               = 1009
-	CodeMandatory            = 1010
-	CodeInternalError        = 1011
-	CodeRestart              = 1012
-	CodeTryAgain             = 1013
-	CodeBadGateway           = 1014
-	CodeTLS                  = 1015
+	CodeGoingAway       Code = 1001
+	CodeProtocolError   Code = 1002
+	CodeUnsupported     Code = 1003
+	CodeReserved        Code = 1004
+	CodeNoStatus        Code = 1005
+	CodeAbnormal        Code = 1006
+	CodeInvalidFrame    Code = 1007
+	CodePolicyViolation Code = 1008
+	CodeTooBig          Code = 1009
+	CodeMandatory       Code = 1010
+	CodeInternalError   Code = 1011
+	CodeRestart         Code = 1012
+	CodeTryAgain        Code = 1013
+	CodeBadGateway      Code = 1014
+	CodeTLS             Code = 1015
 )
 
 var DefaultDialer = &Dialer{
@@ -48,6 +48,14 @@ var (
 	textDecoder = global.Get("TextDecoder").New()
 	textEncoder = global.Get("TextEncoder").New()
 )
+
+type CloseError struct {
+	Code Code
+}
+
+func (x CloseError) Error() string {
+	return fmt.Sprint("code %i", x.Code)
+}
 
 type Code int
 
@@ -62,8 +70,8 @@ type Conn struct {
 	rBuf *io.ReadBuffer  // reads from current message
 
 	closeHandler js.Func
-	closeFunc    func(Code)
-	closeChan    chan struct{}
+	closeChan    chan error
+	closed       bool // explicit Close call
 
 	errorHandler js.Func
 
@@ -73,18 +81,52 @@ type Conn struct {
 }
 
 func (x *Conn) Close() error {
+	x.closed = true
 	x.V.Call("close")
+	x.closeChan <- nil
 	return nil
 }
 
-// OnClose registers fn to be called with the closing code, when the websocket closes.
-func (x *Conn) OnClose(fn func(Code)) {
-	x.closeFunc = fn
-}
-
-// Listen is only present for consistency with the non-wasm version. Will return on websocket close.
+// Listen begins accepting incoming messages.
+// Returns on error or explicit Close call.
 func (x *Conn) Listen() error {
-	<-x.closeChan
+	if x.dstBinary == nil {
+		x.dstBinary = msg.Void{}
+	}
+	if x.dstText == nil {
+		x.dstText = msg.Void{}
+	}
+
+	x.msgHandler = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+		data := args[0].Get("data")
+		var (
+			buf wasm.Bytes
+			dst msg.ReaderTaker
+		)
+		if data.Type() == js.TypeString {
+			bufJs := textEncoder.Call("encode", data)
+			buf = wasm.View(bufJs)
+			dst = x.dstText
+		} else {
+			buf = wasm.View(data)
+			dst = x.dstBinary
+		}
+		r := wasm.BytesReader{buf}
+		x.rBuf.Reset(&r)
+		err := dst.ReaderTake(x.rBuf)
+		if err != nil {
+			x.V.Call("close")
+			x.closeChan <- err
+		}
+
+		return nil
+	})
+	x.V.Set("onmessage", x.msgHandler)
+
+	err := <-x.closeChan
+	if !x.closed {
+		return err
+	}
 	return nil
 }
 
@@ -148,48 +190,21 @@ func (x *Dialer) Dial(url string) (*Conn, error) {
 	o := Conn{
 		V:         ws,
 		wJs:       wasm.BytesWriter{wBytes},
-		closeChan: make(chan struct{}),
+		closeChan: make(chan error, 2),
 	}
 	o.wBuf = io.WriteBufferNew(&o.wJs, make([]byte, x.WriteBufferSize))
 	o.rBuf = io.ReadBufferNew(&wasm.BytesReader{}, make([]byte, x.ReadBufferSize))
 
 	// hook close event
-	o.closeFunc = func(c Code) { fmt.Println("websocket closed", c) }
 	o.closeHandler = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		code := Code(args[0].Get("code").Int())
-		o.closeFunc(code)
-		close(o.closeChan)
+		o.closeChan <- CloseError{code}
 
 		o.cleanup()
 
 		return nil
 	})
 	ws.Set("onclose", o.closeHandler)
-
-	// hook message event
-	o.dstBinary = msg.Void{}
-	o.dstText = msg.Void{}
-	o.msgHandler = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		data := args[0].Get("data")
-		var (
-			buf wasm.Bytes
-			dst msg.ReaderTaker
-		)
-		if data.Type() == js.TypeString {
-			bufJs := textEncoder.Call("encode", data)
-			buf = wasm.View(bufJs)
-			dst = o.dstText
-		} else {
-			buf = wasm.View(data)
-			dst = o.dstBinary
-		}
-		r := wasm.BytesReader{buf}
-		o.rBuf.Reset(&r)
-		dst.ReaderTake(o.rBuf)
-
-		return nil
-	})
-	ws.Set("onmessage", o.msgHandler)
 
 	// failing to connect will issue an error event
 	// the close handler will also be called afterwards
@@ -201,7 +216,7 @@ func (x *Dialer) Dial(url string) (*Conn, error) {
 	ws.Set("onerror", o.errorHandler)
 
 	// wait for connection
-	ch := make(chan struct{})
+	ch := make(chan struct{}, 1)
 	fn := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
 		ch <- struct{}{}
 		return nil

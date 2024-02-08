@@ -1,6 +1,6 @@
 module github.com/blitz-frost/websocket
 
-go 1.20
+go 1.21
 
 require (
 	github.com/blitz-frost/io v0.2.7

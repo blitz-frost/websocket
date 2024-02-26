@@ -192,8 +192,8 @@ func (x *Dialer) Dial(url string) (*Conn, error) {
 		wJs:       wasm.BytesWriter{wBytes},
 		closeChan: make(chan error, 2),
 	}
-	o.wBuf = io.WriteBufferNew(&o.wJs, make([]byte, x.WriteBufferSize))
-	o.rBuf = io.ReadBufferNew(&wasm.BytesReader{}, make([]byte, x.ReadBufferSize))
+	o.wBuf = io.WriteBufferMake(&o.wJs, make([]byte, x.WriteBufferSize))
+	o.rBuf = io.ReadBufferMake(&wasm.BytesReader{}, make([]byte, x.ReadBufferSize))
 
 	// hook close event
 	o.closeHandler = js.FuncOf(func(this js.Value, args []js.Value) interface{} {

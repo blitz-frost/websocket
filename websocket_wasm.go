@@ -44,9 +44,8 @@ var DefaultDialer = &Dialer{
 }
 
 var (
-	global      = js.Global()
-	textDecoder = global.Get("TextDecoder").New()
-	textEncoder = global.Get("TextEncoder").New()
+	textDecoder = wasm.Global.Get("TextDecoder").New()
+	textEncoder = wasm.Global.Get("TextEncoder").New()
 )
 
 type CloseError struct {
@@ -60,68 +59,88 @@ func (x CloseError) Error() string {
 type Code int
 
 type Conn struct {
-	V js.Value // JS websocket object
+	v wasm.Value // JS websocket object
 
-	// JS barrier traversal
-	wJs wasm.BytesWriter
+	dialer Dialer
 
-	// buffer data transfer to and from JS, minimizing slow calls
-	wBuf *io.WriteBuffer // writes to wJs
-	rBuf *io.ReadBuffer  // reads from current message
+	closeChan chan error
+	closeFn   wasm.DynamicFunction
+	closed    bool // explicit Close call
 
-	closeHandler js.Func
-	closeChan    chan error
-	closed       bool // explicit Close call
+	errorFn wasm.DynamicFunction
 
-	errorHandler js.Func
+	wJs  wasm.BytesWriter // JS barrier traversal
+	wBuf *io.WriteBuffer  // writes to wJs; buffers data in order to minimize slow writes
+}
 
-	msgHandler js.Func
-	dstBinary  msg.ReaderTaker
-	dstText    msg.ReaderTaker
+func connMake(url string, dialer Dialer) (*Conn, error) {
+	ws := wasm.Global.Get("WebSocket").New(url)
+	ws.Set("binaryType", "arraybuffer") // requires ones less async function call to read
+
+	wBytes := wasm.BytesMake(0, dialer.WriteBufferSize)
+
+	o := Conn{
+		v:         ws,
+		wJs:       wasm.BytesWriter{wBytes},
+		closeChan: make(chan error, 2), // 1 for Close(), 1 for closeFn
+		dialer:    dialer,
+	}
+	o.wBuf = io.WriteBufferMake(&o.wJs, make([]byte, dialer.WriteBufferSize))
+
+	// hook close event
+	var inter wasm.InterfaceFunc
+	inter = func(this wasm.Value, args []wasm.Value) (wasm.Any, error) {
+		code := Code(args[0].Get("code").Int())
+		o.closeChan <- CloseError{code}
+
+		o.wipe()
+
+		return nil, nil
+	}
+	o.closeFn.Remake(inter)
+	ws.Set("onclose", o.closeFn.Value())
+
+	// failing to connect will issue an error event
+	// the close handler will also be called afterwards
+	errorChan := make(chan struct{})
+	inter = func(this wasm.Value, args []wasm.Value) (wasm.Any, error) {
+		close(errorChan)
+		return nil, nil
+	}
+	o.errorFn.Remake(inter)
+	ws.Set("onerror", o.errorFn.Value())
+
+	// wait for connection
+	ch := make(chan struct{}, 1)
+	inter = func(this wasm.Value, args []wasm.Value) (wasm.Any, error) {
+		close(ch)
+		return nil, nil
+	}
+	openFn := wasm.DynamicFunctionMake(inter)
+	ws.Set("onopen", openFn.Value())
+	defer openFn.Wipe()
+
+	select {
+	case <-ch:
+	case <-errorChan:
+		return nil, errors.New("connection failed")
+	}
+
+	return &o, nil
 }
 
 func (x *Conn) Close() error {
 	x.closed = true
-	x.V.Call("close")
+	x.v.Call("close")
 	x.closeChan <- nil
 	return nil
 }
 
-// Listen begins accepting incoming messages.
-// Returns on error or explicit Close call.
-func (x *Conn) Listen() error {
-	if x.dstBinary == nil {
-		x.dstBinary = msg.Void{}
-	}
-	if x.dstText == nil {
-		x.dstText = msg.Void{}
-	}
-
-	x.msgHandler = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		data := args[0].Get("data")
-		var (
-			buf wasm.Bytes
-			dst msg.ReaderTaker
-		)
-		if data.Type() == js.TypeString {
-			bufJs := textEncoder.Call("encode", data)
-			buf = wasm.View(bufJs)
-			dst = x.dstText
-		} else {
-			buf = wasm.View(data)
-			dst = x.dstBinary
-		}
-		r := wasm.BytesReader{buf}
-		x.rBuf.Reset(&r)
-		err := dst.ReaderTake(x.rBuf)
-		if err != nil {
-			x.V.Call("close")
-			x.closeChan <- err
-		}
-
-		return nil
-	})
-	x.V.Set("onmessage", x.msgHandler)
+// Registers a Function to accept incoming messages. Returns on error or explicit Close().
+//
+// fn - Function({"data": data}); data - string from text channel, ArrayBuffer from binary channel
+func (x *Conn) Listen(fn wasm.Function) error {
+	x.v.Set("onmessage", fn.Value())
 
 	err := <-x.closeChan
 	if !x.closed {
@@ -130,7 +149,73 @@ func (x *Conn) Listen() error {
 	return nil
 }
 
-func (x *Conn) ReaderChain(ch byte, rt msg.ReaderTaker) error {
+// The returned value is specific for this Conn.
+func (x *Conn) ListenInterface() *Listener {
+	return listenerMake(x)
+}
+
+// Wait blocks until the currently buffered data is written out, or the websocket closes.
+// Since the JS API doesn't have an event for this, the current buffer amount is checked every d time.
+//
+// Must not be called from the event loop.
+func (x *Conn) Wait(d time.Duration) {
+	for {
+		if x.v.Get("readyState").Int() == 3 {
+			return
+		}
+
+		if x.v.Get("bufferedAmount").Int() == 0 {
+			return
+		}
+
+		time.Sleep(d)
+	}
+}
+
+// Not concurrent safe.
+func (x *Conn) Writer(ch byte) (msg.Writer, error) {
+	return writer{
+		v:  x.v,
+		b:  &x.wJs.Dst,
+		w:  x.wBuf,
+		ch: ch,
+	}, nil
+}
+
+func (x *Conn) wipe() {
+	x.closeFn.Wipe()
+	x.errorFn.Wipe()
+}
+
+type Dialer struct {
+	ReadBufferSize  int // controls minimum read size from JS to Go
+	WriteBufferSize int // controls minimum write size from Go to JS
+}
+
+func (x Dialer) Dial(url string) (*Conn, error) {
+	return connMake(url, x)
+}
+
+type Listener struct {
+	conn *Conn
+
+	buf *io.ReadBuffer // reads from current message
+
+	dstBinary msg.ReaderTaker
+	dstText   msg.ReaderTaker
+}
+
+func listenerMake(conn *Conn) *Listener {
+	return &Listener{
+		conn:      conn,
+		buf:       io.ReadBufferMake(&wasm.BytesReader{}, make([]byte, conn.dialer.ReadBufferSize)),
+		dstBinary: msg.Void{},
+		dstText:   msg.Void{},
+	}
+}
+
+// Not safe to call while the Listener is in use.
+func (x *Listener) ReaderChain(ch byte, rt msg.ReaderTaker) error {
 	switch ch {
 	case ChannelBinary:
 		x.dstBinary = rt
@@ -142,95 +227,31 @@ func (x *Conn) ReaderChain(ch byte, rt msg.ReaderTaker) error {
 	return nil
 }
 
-// Wait blocks until the currently buffered data is written out, or the websocket closes.
-// Since the JS API doesn't have an event for this, the current buffer amount is checked every d time.
-func (x *Conn) Wait(d time.Duration) {
-	for {
-		if x.V.Get("readyState").Int() == 3 {
-			return
-		}
-
-		if x.V.Get("bufferedAmount").Int() == 0 {
-			return
-		}
-
-		time.Sleep(d)
+// Directs incoming messages according to their respective channel setup.
+// Will close the corresponding Conn if a ReaderTaker returns an error.
+func (x *Listener) Exec(this wasm.Value, args []wasm.Value) (wasm.Any, error) {
+	data := args[0].Get("data")
+	var (
+		buf wasm.Bytes
+		dst msg.ReaderTaker
+	)
+	if data.Type() == js.TypeString {
+		bufJs := textEncoder.Call("encode", data)
+		buf = wasm.View(bufJs)
+		dst = x.dstText
+	} else {
+		buf = wasm.View(data)
+		dst = x.dstBinary
 	}
-}
-
-// Not concurrent safe.
-func (x *Conn) Writer(ch byte) (msg.Writer, error) {
-	return writer{
-		v:  x.V,
-		b:  &x.wJs.Dst,
-		w:  x.wBuf,
-		ch: ch,
-	}, nil
-}
-
-func (x *Conn) cleanup() {
-	x.msgHandler.Release()
-	x.closeHandler.Release()
-	x.errorHandler.Release()
-}
-
-type Dialer struct {
-	ReadBufferSize  int // controls minimum read size from JS to Go
-	WriteBufferSize int // controls minimum write size from Go to JS
-}
-
-// Dial opens a new websocket connection.
-func (x *Dialer) Dial(url string) (*Conn, error) {
-	ws := global.Get("WebSocket").New(url)
-
-	ws.Set("binaryType", "arraybuffer") // requires ones less async function call to read
-
-	wBytes := wasm.BytesMake(0, x.WriteBufferSize)
-
-	o := Conn{
-		V:         ws,
-		wJs:       wasm.BytesWriter{wBytes},
-		closeChan: make(chan error, 2),
-	}
-	o.wBuf = io.WriteBufferMake(&o.wJs, make([]byte, x.WriteBufferSize))
-	o.rBuf = io.ReadBufferMake(&wasm.BytesReader{}, make([]byte, x.ReadBufferSize))
-
-	// hook close event
-	o.closeHandler = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		code := Code(args[0].Get("code").Int())
-		o.closeChan <- CloseError{code}
-
-		o.cleanup()
-
-		return nil
-	})
-	ws.Set("onclose", o.closeHandler)
-
-	// failing to connect will issue an error event
-	// the close handler will also be called afterwards
-	errorChan := make(chan struct{})
-	o.errorHandler = js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		close(errorChan)
-		return nil
-	})
-	ws.Set("onerror", o.errorHandler)
-
-	// wait for connection
-	ch := make(chan struct{}, 1)
-	fn := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
-		ch <- struct{}{}
-		return nil
-	})
-	ws.Set("onopen", fn)
-	defer fn.Release()
-
-	select {
-	case <-ch:
-	case <-errorChan:
-		return nil, errors.New("connection failed")
+	r := wasm.BytesReader{buf}
+	x.buf.Reset(&r)
+	err := dst.ReaderTake(x.buf)
+	if err != nil {
+		x.conn.v.Call("close")
+		x.conn.closeChan <- err
 	}
 
-	return &o, nil
+	return nil, nil
 }
 
 type writer struct {
@@ -246,7 +267,7 @@ func (x writer) Close() error {
 		return err
 	}
 
-	buf := x.b.Js()
+	buf := x.b.Value()
 	switch x.ch {
 	case ChannelBinary:
 		x.v.Call("send", buf)
